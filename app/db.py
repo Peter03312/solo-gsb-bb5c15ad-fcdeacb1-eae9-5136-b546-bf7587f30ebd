@@ -65,6 +65,26 @@ CREATE TABLE IF NOT EXISTS events (
     prev_arrived_at TEXT                    -- 批次内上一事件到达时间，用于报错定位
 );
 CREATE INDEX IF NOT EXISTS idx_events_order ON events(order_id, arrived_at);
+
+-- 理赔申请凭证：一经受理不可变（只插入，不更新、不删除）。
+-- UNIQUE(order_id, idempotency_key)：同订单同幂等键重试 => 原凭证；换类型 => 冲突。
+-- UNIQUE(order_id, claim_type)：同订单同类型至多一张凭证（并发不同键也受数据库层兜底）。
+CREATE TABLE IF NOT EXISTS claim_vouchers (
+    claim_no        TEXT PRIMARY KEY,           -- 申请编号（受理时生成，业务主键）
+    order_id        TEXT NOT NULL REFERENCES orders(order_id),
+    claim_type      TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    received_at     TEXT NOT NULL,              -- UTC ISO8601，服务实际接收申请时间（判定基准）
+    accepted_at     TEXT NOT NULL,              -- UTC ISO8601，受理时间
+    decision_code   TEXT NOT NULL,              -- 判定代号（受理时恒为 FILABLE）
+    policy_version  TEXT NOT NULL,              -- 下单锁定的政策版本号
+    policy_json     TEXT NOT NULL,              -- 受理时适用政策全文快照（不可变）
+    claim_json      TEXT NOT NULL,              -- 该类型判定快照：状态/锚点/截止/证据/依据
+    determination_json TEXT NOT NULL,           -- 受理时整单判定快照（当时判定依据）
+    UNIQUE (order_id, idempotency_key),
+    UNIQUE (order_id, claim_type)
+);
+CREATE INDEX IF NOT EXISTS idx_vouchers_order ON claim_vouchers(order_id);
 """
 
 

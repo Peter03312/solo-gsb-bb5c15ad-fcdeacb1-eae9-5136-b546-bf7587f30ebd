@@ -3,15 +3,17 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
 from .errors import AppError
-from .schemas import CreateOrderRequest, EventBatchRequest, EventIn, EventPreviewRequest
+from .schemas import (ClaimSubmitRequest, CreateOrderRequest, EventBatchRequest,
+                      EventIn, EventPreviewRequest)
 from .services import (archive_determination, create_order, determination_history,
-                       ingest_events, list_events, live_determination, preview_events)
+                       get_voucher, ingest_events, list_events, list_vouchers,
+                       live_determination, preview_events, submit_claim)
 
 
 @asynccontextmanager
@@ -22,8 +24,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="快递理赔时限判定服务",
-    version="1.0.0",
-    description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重与迟到更正。",
+    version="1.1.0",
+    description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重、迟到更正与幂等理赔申请凭证。",
     lifespan=lifespan,
 )
 
@@ -128,6 +130,50 @@ def api_archive(order_id: str, as_of: str | None = None):
 @app.get("/api/v1/orders/{order_id}/determinations")
 def api_history(order_id: str):
     return determination_history(order_id)
+
+
+# ------------------------------------------------------------ 理赔申请（凭证）
+
+@app.post("/api/v1/orders/{order_id}/claims", status_code=201)
+def api_submit_claim(
+    order_id: str,
+    req: ClaimSubmitRequest,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key",
+        description="幂等键，也可在请求体 idempotency_key 中提供；两处不一致返回 422"),
+):
+    """按订单和理赔类型提交申请。
+
+    以服务实际接收时间（body.received_at，缺省当前 UTC）实时核验当前代
+    （当前代已归档也重算，不把归档快照当实时资格）；仅该类型 filable 时受理，
+    返回申请编号、受理时间、判定代号、适用政策、截止时间与当时判定依据。
+    同订单同键同类型重试返回原凭证（200, replayed=true）；换类型 409；
+    同订单同类型已有凭证 409；其余非 filable 状态返回可区分拒绝，不生成凭证。
+    """
+    key = req.idempotency_key
+    if idempotency_key is not None and idempotency_key != key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_MISMATCH",
+            "请求头 Idempotency-Key 与请求体 idempotency_key 不一致",
+            422,
+            {"header_idempotency_key": idempotency_key,
+             "body_idempotency_key": key},
+        )
+    voucher, replayed = submit_claim(order_id, req.claim_type, key,
+                                     received_at=req.received_at)
+    return JSONResponse(status_code=200 if replayed else 201, content=voucher)
+
+
+@app.get("/api/v1/orders/{order_id}/claims")
+def api_list_claims(order_id: str):
+    """列出该订单全部已受理凭证（凭证及其判定依据不可变）。"""
+    return list_vouchers(order_id)
+
+
+@app.get("/api/v1/claims/{claim_no}")
+def api_get_claim(claim_no: str):
+    """按申请编号查询凭证及其所依据的判定代号与冻结判定。"""
+    return get_voucher(claim_no)
 
 
 # ------------------------------------------------------------ 基础数据

@@ -1,12 +1,14 @@
-"""业务服务层：订单、事件摄取、判定装配与归档。"""
+"""业务服务层：订单、事件摄取、判定装配、归档与理赔申请。"""
 import json
+import secrets
+import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import constants as C
 from . import db
 from .db import q, q1
-from .engine import evaluate, parse_dt, resolve_policy, utc_now
+from .engine import evaluate, parse_dt, resolve_policy, to_local, utc_now
 from .errors import AppError
 from .schemas import CreateOrderRequest, EventIn
 
@@ -547,3 +549,250 @@ def list_events(order_id: str) -> dict:
         (order_id,),
     )
     return {"order_id": order_id, "events": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------- 理赔申请（凭证）
+
+# 非 filable 状态 -> 可区分的业务拒绝代号（不生成凭证）
+_REJECTION_BY_STATUS = {
+    "pending": ("CLAIM_PENDING", "理赔事由的触发事件尚未出现，暂不受理"),
+    "not_filable": ("CLAIM_DEADLINE_PASSED", "已过当地申请截止时刻，不再受理"),
+    "not_applicable": ("CLAIM_NOT_APPLICABLE", "按现有扫描事件该理赔事由不成立，不予受理"),
+    "indeterminate": ("CLAIM_INDETERMINATE", "证据不足、该类型不可判定，不予受理"),
+}
+
+
+def _new_claim_no(accepted_utc: datetime) -> str:
+    return f"CLM-{accepted_utc.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4).upper()}"
+
+
+def _recheck_at_receive_time(conn, order: dict, policy: dict, received_utc: datetime) -> dict:
+    """以服务实际接收时间核验当前代资格——即使当前代已归档也实时重算。
+
+    - 不读取 generations.determination_json 归档快照，只以当前最新代的事件视图重算；
+    - 接收时刻之后到达的事件/更正不构成本次核验依据（arrived_at > received_at 剔除）；
+    - 订单仍按下单时锁定的政策版本（order.created_policy）判定。
+    """
+    gen = _latest_gen(conn, order["order_id"])
+    rows = _events_until_gen(conn, order["order_id"], gen["id"])
+    visible = [r for r in rows if parse_dt(r["arrived_at"]) <= received_utc]
+    gen_info = {"gen_no": gen["gen_no"], "supersedes_gen": gen["supersedes_gen"]}
+    result = evaluate(order, visible, policy, as_of=received_utc, generation_info=gen_info)
+
+    if gen["archived"]:
+        # 明确记录：资格是按接收时间重算的，未把较早归档快照当作实时资格
+        result["basis"].append(
+            f"第 {gen['gen_no']} 代判定虽已归档，本申请仍按服务接收时间 "
+            f"{to_local(received_utc, order['timezone']).isoformat()} 重新核验，"
+            "未采用较早的归档快照作为实时资格"
+        )
+        result["archived_generation_rechecked"] = True
+    else:
+        result["archived_generation_rechecked"] = False
+    return result
+
+
+def _voucher_row(conn, claim_no: str | None = None, *, order_id: str | None = None,
+                 idem_key: str | None = None):
+    if claim_no is not None:
+        return conn.execute(
+            "SELECT * FROM claim_vouchers WHERE claim_no = ?", (claim_no,)
+        ).fetchone()
+    return conn.execute(
+        "SELECT * FROM claim_vouchers WHERE order_id = ? AND idempotency_key = ?",
+        (order_id, idem_key),
+    ).fetchone()
+
+
+def _voucher_payload(row, replayed: bool = False) -> dict:
+    """凭证一经受理不可变：所有字段均来自受理时冻结的快照行。"""
+    claim = json.loads(row["claim_json"])
+    determination = json.loads(row["determination_json"])
+    policy = json.loads(row["policy_json"])
+    window = next((r["window"] for r in policy["claims"]
+                   if r["claim_type"] == row["claim_type"]), None)
+    return {
+        "claim_no": row["claim_no"],
+        "order_id": row["order_id"],
+        "claim_type": row["claim_type"],
+        "claim_name": C.CLAIM_LABELS[row["claim_type"]],
+        "idempotency_key": row["idempotency_key"],
+        "received_at_utc": row["received_at"],
+        "accepted_at_utc": row["accepted_at"],
+        "decision_code": row["decision_code"],          # 受理时恒为 FILABLE
+        "status": "accepted",
+        "replayed": replayed,
+        "immutable": True,
+        "policy_version": row["policy_version"],
+        "policy": {
+            "version": policy.get("version"),
+            "display_name": policy.get("display_name"),
+            "window": window,
+            "default_cutoff": policy.get("default_cutoff"),
+        },
+        "anchor_time_utc": claim.get("anchor_time"),
+        "deadline_local": claim.get("deadline_local"),
+        "deadline_utc": claim.get("deadline_utc"),
+        "missing_evidence": claim.get("missing_evidence", []),
+        "basis": claim.get("basis", []),                 # 该类型当时的判定依据
+        "generation_no": determination.get("generation_no"),
+        "archived_generation_rechecked": determination.get(
+            "archived_generation_rechecked", False),
+        "determination_basis": determination.get("basis", []),
+        "claim": claim,                                  # 冻结的该类型判定
+        "determination": determination,                  # 冻结的整单判定
+    }
+
+
+def submit_claim(order_id: str, claim_type: str, idem_key: str,
+                 received_at: datetime | None = None) -> tuple[dict, bool]:
+    """受理一笔理赔申请。返回 (凭证, 是否幂等重放)。
+
+    - 以服务实际接收时间（received_at，缺省=当前 UTC）实时核验当前代，
+      当前代已归档也不使用归档快照；
+    - 仅当该类型状态为 filable 时受理并冻结凭证；否则按状态给可区分拒绝，不生成凭证；
+    - 同订单同幂等键同类型重试 => 原凭证（replayed=True）；同键换类型 => 409；
+    - 同订单同类型至多一张凭证，并发不同键由进程锁 + UNIQUE 双重兜底。
+    """
+    order = require_order(order_id)
+    if claim_type not in C.ALL_CLAIMS:
+        raise AppError(
+            "CLAIM_TYPE_INVALID",
+            f"未知理赔类型: {claim_type}，允许: {list(C.ALL_CLAIMS)}",
+            422,
+        )
+    received_utc = parse_dt(received_at) if received_at is not None else utc_now()
+    from .engine import load_policy
+    policy = load_policy(order["created_policy"])
+
+    with db.tx() as conn:
+        # 1) 幂等键：同订单同键只指向一张凭证
+        existing = _voucher_row(conn, order_id=order_id, idem_key=idem_key)
+        if existing is not None:
+            if existing["claim_type"] == claim_type:
+                return _voucher_payload(existing, replayed=True), True
+            raise AppError(
+                "CLAIM_CONFLICT",
+                f"幂等键 {idem_key} 已用于订单 {order_id} 的 "
+                f"{existing['claim_type']} 类申请，不能再用于 {claim_type} 类",
+                409,
+                {"idempotency_key": idem_key,
+                 "submitted_claim_type": claim_type,
+                 "existing_claim_type": existing["claim_type"],
+                 "existing_claim_no": existing["claim_no"]},
+            )
+
+        # 2) 同订单同类型至多一张凭证（不同键也不允许）
+        same_type = conn.execute(
+            "SELECT * FROM claim_vouchers WHERE order_id = ? AND claim_type = ?",
+            (order_id, claim_type),
+        ).fetchone()
+        if same_type is not None:
+            raise AppError(
+                "CLAIM_ALREADY_ACCEPTED",
+                f"订单 {order_id} 的 {claim_type} 类理赔已受理（凭证 {same_type['claim_no']}），"
+                "同一订单同一类型至多一张凭证",
+                409,
+                {"claim_type": claim_type,
+                 "existing_claim_no": same_type["claim_no"],
+                 "existing_idempotency_key": same_type["idempotency_key"]},
+            )
+
+        # 3) 以接收时间实时核验（即使当前代已归档，也重算而非读快照）
+        determination = _recheck_at_receive_time(conn, order, policy, received_utc)
+        claim_result = next(c for c in determination["claims"]
+                            if c["claim_type"] == claim_type)
+        status = claim_result["status"]
+        if status != "filable":
+            code, reason = _REJECTION_BY_STATUS[status]
+            raise AppError(
+                code,
+                f"{C.CLAIM_LABELS[claim_type]}理赔申请不予受理：{reason}",
+                422,
+                {"order_id": order_id,
+                 "claim_type": claim_type,
+                 "status": status,
+                 "decision_code": status.upper(),
+                 "received_at_utc": received_utc.isoformat(),
+                 "policy_version": policy["version"],
+                 "generation_no": determination["generation_no"],
+                 "deadline_local": claim_result.get("deadline_local"),
+                 "deadline_utc": claim_result.get("deadline_utc"),
+                 "missing_evidence": claim_result.get("missing_evidence", []),
+                 "basis": claim_result.get("basis", []),
+                 "voucher_generated": False},
+            )
+
+        # 4) 受理：冻结凭证（之后更正/新代只影响当前判定，不影响本凭证）
+        accepted_utc = utc_now()
+        row = None
+        for _ in range(3):
+            claim_no = _new_claim_no(accepted_utc)
+            try:
+                conn.execute(
+                    """INSERT INTO claim_vouchers(
+                           claim_no, order_id, claim_type, idempotency_key,
+                           received_at, accepted_at, decision_code,
+                           policy_version, policy_json, claim_json, determination_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (claim_no, order_id, claim_type, idem_key,
+                     received_utc.isoformat(), accepted_utc.isoformat(), "FILABLE",
+                     policy["version"], json.dumps(policy, ensure_ascii=False),
+                     json.dumps(claim_result, ensure_ascii=False),
+                     json.dumps(determination, ensure_ascii=False)),
+                )
+                row = _voucher_row(conn, claim_no=claim_no)
+                break
+            except sqlite3.IntegrityError as exc:
+                # 并发兜底：UNIQUE 命中则重新读取既有凭证并按幂等/冲突处理
+                conflicted = _voucher_row(conn, order_id=order_id, idem_key=idem_key)
+                if conflicted is not None:
+                    if conflicted["claim_type"] == claim_type:
+                        return _voucher_payload(conflicted, replayed=True), True
+                    raise AppError(
+                        "CLAIM_CONFLICT",
+                        f"幂等键 {idem_key} 已用于 {conflicted['claim_type']} 类申请",
+                        409,
+                        {"idempotency_key": idem_key,
+                         "submitted_claim_type": claim_type,
+                         "existing_claim_type": conflicted["claim_type"],
+                         "existing_claim_no": conflicted["claim_no"]},
+                    )
+                same = conn.execute(
+                    "SELECT * FROM claim_vouchers WHERE order_id = ? AND claim_type = ?",
+                    (order_id, claim_type),
+                ).fetchone()
+                if same is not None:
+                    raise AppError(
+                        "CLAIM_ALREADY_ACCEPTED",
+                        f"订单 {order_id} 的 {claim_type} 类理赔已受理（凭证 {same['claim_no']}）",
+                        409,
+                        {"claim_type": claim_type,
+                         "existing_claim_no": same["claim_no"],
+                         "existing_idempotency_key": same["idempotency_key"]},
+                    )
+                # 仅申请编号撞号（极小概率）：换新编号重试；其余异常抛出
+                if "claim_vouchers.UNIQUE" not in str(exc) and "claim_no" not in str(exc):
+                    raise
+                accepted_utc = utc_now()
+        if row is None:
+            raise AppError("CLAIM_ACCEPT_FAILED", "凭证生成失败，请重试", 500)
+
+    return _voucher_payload(row, replayed=False), False
+
+
+def get_voucher(claim_no: str) -> dict:
+    row = q1("SELECT * FROM claim_vouchers WHERE claim_no = ?", (claim_no,))
+    if row is None:
+        raise AppError("VOUCHER_NOT_FOUND", f"凭证不存在: {claim_no}", 404)
+    return _voucher_payload(row)
+
+
+def list_vouchers(order_id: str) -> dict:
+    require_order(order_id)
+    rows = q(
+        "SELECT * FROM claim_vouchers WHERE order_id = ? "
+        "ORDER BY accepted_at, claim_no",
+        (order_id,),
+    )
+    return {"order_id": order_id, "vouchers": [_voucher_payload(r) for r in rows]}

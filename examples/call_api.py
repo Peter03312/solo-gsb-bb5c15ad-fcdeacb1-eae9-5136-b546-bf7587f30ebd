@@ -10,7 +10,9 @@
 4. 重放同一事件 -> 不重复计入；倒序事件 -> 明确错误；
 5. 无写入预演迟到的更正事件 -> 模拟新一代结果与判定差异，系统状态不变；
 6. 正式提交该更正事件 -> 产生第 2 代新判定，与预演结果一致，第 1 代快照不变；
-7. 查询判定历史。
+7. 查询判定历史；
+8. 理赔申请：按接收时间核验受理并生成不可变凭证（含幂等重试/换类型冲突/
+   同类型重复受理/非 filable 拒绝/凭证查询）。
 """
 import json
 import os
@@ -139,7 +141,103 @@ def main():
             print(f"  第 {g['generation_no']} 代 | archived={g['archived']} | "
                   f"状态={status} | supersedes={g['supersedes_generation']}")
 
+    claim_demo()
+
     print("\n示例完成。交互文档：" + BASE + "/docs")
+
+
+def claim_demo():
+    """理赔申请（凭证）全链路：独立订单，互不干扰。"""
+    oid = "DEMO-CLAIM-20250205-001"
+    print("\n\n########## 理赔申请（凭证）演示 ##########")
+    r = call("POST", "/api/v1/orders", {
+        "order_id": oid,
+        "created_at": "2025-02-05T09:00:00+08:00",
+        "timezone": "Asia/Shanghai",
+        "calendar_code": "CN",
+        "promise_by": "2025-02-10T18:00:00+08:00",
+        "weight_kg": 2.5,
+    })
+    if r is None:
+        print("理赔演示订单创建失败（可能已存在于持久化数据中），跳过本段演示；"
+              "重跑可换新 ORDER_ID")
+        return
+    call("POST", f"/api/v1/orders/{oid}/events", {
+        "event_id": "EV-CLAIM-SIGNED-01",
+        "event_type": "signed",
+        "event_time": "2025-02-11T10:00:00+08:00",
+        "arrived_at": "2025-02-11T10:05:00+08:00",
+    })
+
+    # 1) 提交申请：以服务接收时间 2/20 实时核验 -> delay=filable，受理并出凭证
+    payload = {
+        "claim_type": "delay",
+        "idempotency_key": "IDEMP-20250220-001",
+        "received_at": "2025-02-20T12:00:00+08:00",   # 缺省则取服务当前 UTC
+    }
+    v = call("POST", f"/api/v1/orders/{oid}/claims", payload)
+    print("\n--- 1) 首次申请（201，受理） ---")
+    if v:
+        print(f"  申请编号 {v['claim_no']}")
+        print(f"  受理时间(UTC) {v['accepted_at_utc']} | 接收时间(UTC) {v['received_at_utc']}")
+        print(f"  判定代号 {v['decision_code']} | 适用政策 {v['policy_version']}")
+        print(f"  截止时间 {v['deadline_local']}（UTC {v['deadline_utc']}）")
+        print("  当时判定依据：")
+        for line in v["basis"]:
+            print("   -", line)
+        claim_no = v["claim_no"]
+    else:
+        claim_no = None
+
+    # 2) 同订单同键同类型重试 -> 返回原凭证（200, replayed=true），不重新受理
+    retry = call("POST", f"/api/v1/orders/{oid}/claims", payload)
+    print("\n--- 2) 同键同类型重试（幂等，返回原凭证） ---")
+    if retry:
+        print(f"  replayed={retry['replayed']} claim_no={retry['claim_no']} "
+              f"（与首次相同：{retry['claim_no'] == claim_no}）")
+
+    # 3) 同订单同键换类型 -> 409 CLAIM_CONFLICT
+    call("POST", f"/api/v1/orders/{oid}/claims",
+         {**payload, "claim_type": "damage"})
+    print("--- 3) 同键换类型：期望 409 CLAIM_CONFLICT（见上） ---")
+
+    # 4) 同订单同类型换键 -> 409 CLAIM_ALREADY_ACCEPTED
+    call("POST", f"/api/v1/orders/{oid}/claims",
+         {**payload, "idempotency_key": "IDEMP-OTHER-KEY"})
+    print("--- 4) 同类型另一键：期望 409 CLAIM_ALREADY_ACCEPTED（见上） ---")
+
+    # 5) 非 filable 状态：damage 无触发事件 -> 422 CLAIM_PENDING，不生成凭证
+    call("POST", f"/api/v1/orders/{oid}/claims",
+         {"claim_type": "damage", "idempotency_key": "IDEMP-DAMAGE-001",
+          "received_at": "2025-02-12T10:00:00+08:00"})
+    print("--- 5) 破损类尚无触发事件：期望 422 CLAIM_PENDING，不生成凭证（见上） ---")
+
+    # 6) 已过截止：接收时间 2/26（截止 2/25 23:59:59）-> 422 CLAIM_DEADLINE_PASSED
+    call("POST", "/api/v1/orders", {
+        "order_id": oid + "-LATE",
+        "created_at": "2025-02-05T09:00:00+08:00",
+        "timezone": "Asia/Shanghai", "calendar_code": "CN",
+        "promise_by": "2025-02-10T18:00:00+08:00"})
+    call("POST", f"/api/v1/orders/{oid}-LATE/events", {
+        "event_id": "EV-CLAIM-LATE-SIGNED",
+        "event_type": "signed",
+        "event_time": "2025-02-11T10:00:00+08:00",
+        "arrived_at": "2025-02-11T10:05:00+08:00"})
+    call("POST", f"/api/v1/orders/{oid}-LATE/claims",
+         {"claim_type": "delay", "idempotency_key": "IDEMP-LATE-001",
+          "received_at": "2025-02-26T08:00:00+08:00"})
+    print("--- 6) 过截止后申请：期望 422 CLAIM_DEADLINE_PASSED（见上） ---")
+
+    # 7) 按申请编号查询凭证（含冻结的判定代号与当时判定依据）
+    if claim_no:
+        got = call("GET", f"/api/v1/claims/{claim_no}")
+        print("\n--- 7) 查询凭证 ---")
+        if got:
+            print(f"  {got['claim_no']} | {got['claim_type']} | "
+                  f"decision_code={got['decision_code']} | immutable={got['immutable']}")
+    lst = call("GET", f"/api/v1/orders/{oid}/claims")
+    if lst:
+        print(f"  订单 {oid} 已有凭证 {len(lst['vouchers'])} 张（同类型至多一张）")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@
 - 当前是否可申请（`eligible_to_file` / `overall_status`）；
 - 各理赔类型的**截止时间**（当地时间 + UTC）；
 - **缺失证据**清单；
-- 逐条可审计的**判定依据**（含适用政策版本、起算事件、跳节假日说明、更正记录）。
+- 逐条可审计的**判定依据**（含适用政策版本、起算事件、跳节假日说明、更正记录）；
+- **理赔申请受理**：按服务实际接收时间实时核验并出具不可变申请凭证（幂等受理、同类型唯一、可查询）。
 
 ## 判定规则
 
@@ -54,22 +55,45 @@
    更正只影响"物化"后的判定视图，原始事件行永不修改或删除。
 6. **无写入预演**：`POST .../events/preview` 在当前最新代事件视图上按同一套规则模拟整批处理，返回逐项校验结果、首个失败位置、模拟后的各理赔状态/截止时间/缺失证据与判定依据差异；任一事件违反约束即整批预演失败（错误码与正式摄取一致），全程不写事件、不开新代、不改归档快照。已归档订单的预演明确按**新一代**（`gen_no+1`）结果计算。
 
+### 理赔申请与凭证（本轮新增）
+
+客户按**订单 + 理赔类型**提交申请（`POST /api/v1/orders/{id}/claims`），核验与受理规则：
+
+1. **以服务实际接收时间核验**：以请求中的 `received_at`（带时区偏移；缺省取服务当前 UTC）为判定基准，核验该订单**当前代**的有效扫描事件、下单时锁定的政策版本与当地截止时刻。接收时刻**之后**到达的事件/更正不构成本次依据。
+2. **已归档也实时重算**：即使当前代已归档，也按接收时间重新核验，**不把较早归档快照当成实时资格**；快照后的迟到事件若已开启新代，按新代实时结果判定。受理凭证会标注 `archived_generation_rechecked` 并在依据中说明。
+3. **只有 `filable` 才受理**：受理返回 201 与不可变凭证——申请编号 `claim_no`、接收/受理时间、判定代号 `decision_code=FILABLE`、适用政策（版本+窗口快照）、锚点/截止时间（当地+UTC）、该类型当时判定依据与冻结的整单判定。其他状态**不生成凭证**，返回可区分的业务拒绝：
+
+   | 接收时状态 | 错误码 | 含义 |
+   |---|---|---|
+   | `pending` | `CLAIM_PENDING` (422) | 触发事件尚未出现 |
+   | `not_filable` | `CLAIM_DEADLINE_PASSED` (422) | 已过当地截止时刻 |
+   | `not_applicable` | `CLAIM_NOT_APPLICABLE` (422) | 理赔事由不成立 |
+   | `indeterminate` | `CLAIM_INDETERMINATE` (422) | 证据不足不可判定 |
+
+   拒绝体 `error.details` 带 `status` / `decision_code`（状态大写）/ 截止时间 / 缺失证据 / 当时依据 / `voucher_generated=false`；拒绝**不消耗**幂等键，状态转为可申请后同键可再提交。
+4. **幂等键**（必填，请求体 `idempotency_key` 或请求头 `Idempotency-Key`，两处不一致返回 422）：
+   - 同订单**同键同类型**重试 => 返回**原凭证**（HTTP 200，`replayed=true`），不重新受理、不改变任何时间与依据；
+   - 同订单**同键换类型** => 409 `CLAIM_CONFLICT`（details 指向既有凭证）；
+   - 同订单**同类型至多一张凭证**：不同键再来 => 409 `CLAIM_ALREADY_ACCEPTED`；不同类型各可一张；
+   - 并发放心重试：进程内写锁串行化 + 数据库 `UNIQUE(order_id, claim_type)`、`UNIQUE(order_id, idempotency_key)` 双保险，并发不同键也不会双重受理。
+5. **凭证一经受理不可变**：之后的更正或新代只影响"当前判定"，凭证冻结的政策、截止时间与判定依据永不改变。`GET /api/v1/claims/{claim_no}` 可查凭证及其所依据的判定代号；`GET /api/v1/orders/{id}/claims` 列订单全部凭证。
+
 ## 目录结构
 
 ```
 app/
   config.py        # 环境变量配置（数据目录、默认截止钟点）
   constants.py     # 事件/理赔类型与中文标签
-  db.py            # SQLite 连接、建表、串行化写事务
+  db.py            # SQLite 连接、建表（含不可变 claim_vouchers）、串行化写事务
   engine.py        # 纯函数核心：政策选取/工作日推算/事件物化/判定
   errors.py        # 业务错误码
   schemas.py       # Pydantic 入参模型与时区校验
   seed_data.py     # 政策版本 + CN 2024/2025 节假日种子
-  services.py      # 订单、事件摄取、归档/开代、判定装配
+  services.py      # 订单、事件摄取、归档/开代、判定装配、理赔申请受理/查询
   main.py          # FastAPI 路由
 init_db.py         # 初始化入口（建表 + 种子，幂等）
-examples/call_api.py  # 端到端调用示例（仅标准库）
-tests/             # pytest 引擎单测 + API 端到端测试（41 个用例）
+examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请全链路）
+tests/             # pytest 引擎单测 + API 端到端测试（68 个用例）
 Dockerfile, docker-compose.yml
 ```
 
@@ -130,6 +154,9 @@ pytest -q
 | GET | `/api/v1/orders/{id}/determination?as_of=...` | 当前判定（最新代已归档则返回快照） |
 | POST | `/api/v1/orders/{id}/determination/archive?as_of=...` | 归档当前代判定 |
 | GET | `/api/v1/orders/{id}/determinations` | 全部"代"的判定历史与快照 |
+| POST | `/api/v1/orders/{id}/claims` | **提交理赔申请**：按接收时间实时核验，filable 则出不可变凭证（幂等） |
+| GET | `/api/v1/orders/{id}/claims` | 该订单全部已受理凭证 |
+| GET | `/api/v1/claims/{claim_no}` | 按申请编号查凭证及其判定代号/冻结依据 |
 | GET | `/api/v1/policies` | 政策版本列表 |
 | GET | `/api/v1/calendars/{code}` | 节假日表 |
 
@@ -269,9 +296,73 @@ curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/events/preview \
 
 预演失败（如到达顺序违规）返回与正式摄取相同的错误码，`error.details` 内含逐项校验结果与 `first_failure_index`，且同样零写入。
 
+### 理赔申请示例
+
+**1) 受理（201，仅当接收时该类型 filable）**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/claims \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: IDEMP-20250220-001' \
+  -d '{
+    "claim_type": "delay",
+    "idempotency_key": "IDEMP-20250220-001",
+    "received_at": "2025-02-20T12:00:00+08:00"
+  }'
+```
+
+响应节选：
+
+```json
+{
+  "claim_no": "CLM-20250220120000-9F2A1C77",
+  "order_id": "O-1001",
+  "claim_type": "delay",
+  "claim_name": "延迟送达",
+  "idempotency_key": "IDEMP-20250220-001",
+  "received_at_utc": "2025-02-20T04:00:00+00:00",
+  "accepted_at_utc": "2025-02-20T04:00:00.182344+00:00",
+  "decision_code": "FILABLE",
+  "status": "accepted",
+  "replayed": false,
+  "immutable": true,
+  "policy_version": "v2",
+  "policy": {"version": "v2", "window": {"days": 10, "day_basis": "business", "cutoff": "23:59:59"}},
+  "deadline_local": "2025-02-25T23:59:59+08:00",
+  "deadline_utc": "2025-02-25T15:59:59+00:00",
+  "missing_evidence": [],
+  "basis": ["实际签收 ... 构成延迟送达", "时限 10 个工作日（已跳过当地节假日），截止 2025-02-25 23:59:59 CST", "当前时间在申请时限内，可申请"],
+  "generation_no": 1,
+  "archived_generation_rechecked": false,
+  "claim": { "...该类型完整判定快照（冻结）..." },
+  "determination": { "...整单完整判定快照（冻结）..." }
+}
+```
+
+**2) 同键同类型重试**（网络超时/客户端重试）：返回 **200** 同一凭证，`replayed=true`，接收时间/受理时间/依据均为首次值。同键换类型：**409 CLAIM_CONFLICT**；同类型换键：**409 CLAIM_ALREADY_ACCEPTED**。
+
+**3) 不予受理**：如在 2/26（截止后）提交，返回 **422 CLAIM_DEADLINE_PASSED**，不生成凭证：
+
+```json
+{"error": {"code": "CLAIM_DEADLINE_PASSED", "message": "延迟送达理赔申请不予受理：已过当地申请截止时刻，不再受理",
+  "details": {"claim_type": "delay", "status": "not_filable", "decision_code": "NOT_FILABLE",
+              "deadline_local": "2025-02-25T23:59:59+08:00", "voucher_generated": false, "basis": ["..."]}}}
+```
+
+**4) 查询凭证**：`GET /api/v1/claims/CLM-...`（含判定代号与冻结依据）；`GET /api/v1/orders/O-1001/claims` 列全部凭证。
+
+> 说明：申请受理不会归档或推进任何"代"；当前代归档与否都按接收时间现算。凭证是只追加（insert-only）数据，无更新/删除接口。
+
 ## 设计取舍与扩展
 
 - **存储**：SQLite + 进程内互斥锁，事件"顺序校验 + 插入"在单事务内完成；水平扩展或多副本时把 `app/db.py` 换成 Postgres（事件表加 `(order_id, arrived_at)` 约束即可）。
 - **新增政策版本**：向 `policies` 表插入一行 JSON（时限天数、工作日/自然日、截止钟点均可配），无需发版；新增节假日在 `calendars` 表 upsert。
 - **新增理赔类型/扫描事件**：在 `constants.py` 登记标签、政策 JSON 增规则、`engine.py` 增加一个 resolver，接口与代际机制无需改动。
 - 截止钟点默认 23:59:59，可被政策窗口级 `cutoff` 或环境变量 `CLAIM_DEFAULT_CUTOFF` 覆盖。
+
+### 本轮变动（v1.1.0）
+
+- 新增理赔申请能力：`POST /orders/{id}/claims`（幂等受理）、`GET /orders/{id}/claims`、`GET /claims/{claim_no}`；新增只追加表 `claim_vouchers`（建表语句带 `IF NOT EXISTS`，老数据目录重启即自动升级，历史数据不受影响）。
+- 核验以**服务实际接收时间**为准实时重算，即使当前代已归档也不采用归档快照；接收时刻之后到达的事件不计入依据。
+- 受理即冻结政策全文、该类型判定与整单判定；后续更正/新代不改凭证。
+- 既有事件摄取、无写入预演、归档、判定接口及统一错误体 `{"error":{...}}` 约定**完全保持不变**；测试由 41 个增至 68 个。

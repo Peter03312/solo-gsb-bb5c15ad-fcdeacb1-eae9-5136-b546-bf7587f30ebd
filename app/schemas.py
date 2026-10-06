@@ -68,3 +68,21 @@ class EventPreviewRequest(BaseModel):
         if v is not None:
             _aware(v, "as_of")
         return v
+
+
+class ClaimSubmitRequest(BaseModel):
+    """理赔申请入参：理赔类型 + 幂等键（必填）+ 可选的服务接收时刻（回溯测试用）。"""
+    claim_type: str = Field(description="理赔类型：delay | damage | loss")
+    idempotency_key: str = Field(
+        min_length=1,
+        description="客户端幂等键；同订单同键同类型重试返回原凭证，换类型报冲突")
+    received_at: datetime | None = Field(
+        default=None,
+        description="服务实际接收申请的时刻（带时区偏移），缺省取服务当前 UTC 时间")
+
+    @field_validator("received_at")
+    @classmethod
+    def _tz(cls, v):
+        if v is not None:
+            _aware(v, "received_at")
+        return v
