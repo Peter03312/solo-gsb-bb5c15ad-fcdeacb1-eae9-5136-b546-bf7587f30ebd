@@ -3,13 +3,15 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from . import db
 from .errors import AppError
-from .schemas import CreateOrderRequest, EventBatchRequest, EventIn, EventPreviewRequest
+from .schemas import (ClaimApplicationRequest, CreateOrderRequest, EventBatchRequest,
+                      EventIn, EventPreviewRequest)
+from . import claims
 from .services import (archive_determination, create_order, determination_history,
                        ingest_events, list_events, live_determination, preview_events)
 
@@ -22,8 +24,9 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="快递理赔时限判定服务",
-    version="1.0.0",
-    description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重与迟到更正。",
+    version="1.1.0",
+    description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重、"
+                "迟到更正、代际归档，以及理赔申请受理与不可变凭证（幂等）。",
     lifespan=lifespan,
 )
 
@@ -128,6 +131,45 @@ def api_archive(order_id: str, as_of: str | None = None):
 @app.get("/api/v1/orders/{order_id}/determinations")
 def api_history(order_id: str):
     return determination_history(order_id)
+
+
+# ------------------------------------------------------------ 理赔申请受理（凭证）
+
+@app.post("/api/v1/orders/{order_id}/claims")
+def api_submit_claim(order_id: str, req: ClaimApplicationRequest,
+                     response: Response,
+                     idempotency_key: str | None = Header(default=None)):
+    """按订单与理赔类型提交理赔申请。
+
+    - 以服务实际接收时间（received_at，缺省=服务当前 UTC）核验当前代有效事件、
+      下单锁定政策与当地截止时刻；当前代已归档也按接收时间重新核验，不采用归档快照；
+    - 仅该类型为 filable 才受理并返回不可变凭证；否则返回可区分的业务拒绝码，不生成凭证；
+    - 幂等键取请求体 idempotency_key 或 Idempotency-Key 头：
+      同订单同键同类型重试返回原凭证（200, idempotent_replay=true）；
+      同订单同键换类型 => 409 IDEMPOTENCY_KEY_CONFLICT；
+      同订单同类型换键重复受理 => 409 CLAIM_ALREADY_ACCEPTED。
+    """
+    from .services import require_order
+    require_order(order_id)
+    key = req.idempotency_key or idempotency_key
+    voucher, replay = claims.submit_claim(order_id, req, key)
+    response.status_code = 200 if replay else 201
+    return voucher
+
+
+@app.get("/api/v1/orders/{order_id}/claims")
+def api_list_claims(order_id: str,
+                    claim_type: str | None = None,
+                    determination_code: str | None = None):
+    """查询订单下的受理凭证；可按理赔类型 / 判定代号过滤。"""
+    return claims.list_applications(order_id, claim_type=claim_type,
+                                    determination_code=determination_code)
+
+
+@app.get("/api/v1/orders/{order_id}/claims/{application_id}")
+def api_get_claim(order_id: str, application_id: str):
+    """查询单张不可变凭证及其所依据的判定代号/判定依据。"""
+    return claims.get_application(order_id, application_id)
 
 
 # ------------------------------------------------------------ 基础数据

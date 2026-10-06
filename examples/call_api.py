@@ -10,7 +10,10 @@
 4. 重放同一事件 -> 不重复计入；倒序事件 -> 明确错误；
 5. 无写入预演迟到的更正事件 -> 模拟新一代结果与判定差异，系统状态不变；
 6. 正式提交该更正事件 -> 产生第 2 代新判定，与预演结果一致，第 1 代快照不变；
-7. 查询判定历史。
+7. 查询判定历史；
+8. 理赔申请受理：按服务接收时间核验并领取不可变凭证；
+   同键同类型重试返回原凭证；换键重复受理 / 换类型复用键 => 409；
+   截止后申请被明确拒绝且不出凭证；按凭证号 / 判定代号查询。
 """
 import json
 import os
@@ -19,16 +22,19 @@ import urllib.request
 
 BASE = os.environ.get("BASE_URL", "http://localhost:8000")
 ORDER_ID = "DEMO-20250205-001"
+CLAIM_ORDER_ID = "DEMO-CLAIM-20250205-001"
 
 
-def call(method: str, path: str, payload=None, params=None):
+def call(method: str, path: str, payload=None, params=None, headers=None):
     url = BASE + path
     if params:
         from urllib.parse import urlencode
         url += "?" + urlencode(params)
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
     try:
         with urllib.request.urlopen(req) as resp:
             body = json.loads(resp.read().decode())
@@ -139,7 +145,98 @@ def main():
             print(f"  第 {g['generation_no']} 代 | archived={g['archived']} | "
                   f"状态={status} | supersedes={g['supersedes_generation']}")
 
+    demo_claim_acceptance()
+
     print("\n示例完成。交互文档：" + BASE + "/docs")
+
+
+def demo_claim_acceptance():
+    """理赔申请受理链路（独立订单，避免与上面更正链路互相影响）。"""
+    print("\n\n########## 理赔申请受理（不可变凭证） ##########")
+    payload = {
+        "order_id": CLAIM_ORDER_ID,
+        "created_at": "2025-02-05T09:00:00+08:00",
+        "timezone": "Asia/Shanghai",
+        "calendar_code": "CN",
+        "promise_by": "2025-02-10T18:00:00+08:00",
+        "weight_kg": 2.5,
+    }
+    r = call("POST", "/api/v1/orders", payload)
+    if r is None:
+        print("受理演示订单创建失败，跳过后续步骤")
+        return
+    call("POST", f"/api/v1/orders/{CLAIM_ORDER_ID}/events", {
+        "event_id": "EV-SIGNED-C1", "event_type": "signed",
+        "event_time": "2025-02-11T10:00:00+08:00",
+        "arrived_at": "2025-02-11T10:05:00+08:00",
+    })
+
+    claims_path = f"/api/v1/orders/{CLAIM_ORDER_ID}/claims"
+
+    print("\n===== 1) 时限内（接收时间 2/20）提交延迟理赔：201 出凭证 =====")
+    v = call("POST", claims_path, {
+        "claim_type": "delay",
+        "idempotency_key": "IDEMP-DELAY-001",
+        "received_at": "2025-02-20T12:00:00+08:00",   # 服务实际接收时间（核验基准）
+        "note": "客户网点柜面提交",
+    })
+    if not v:
+        return
+    print(json.dumps({
+        "application_id": v["application_id"],
+        "accepted_at_utc": v["accepted_at_utc"],
+        "determination_code": v["determination_code"],
+        "policy_version": v["policy_version"],
+        "deadline_local": v["deadline_local"],
+        "generation_archived_at_receipt": v["generation_archived_at_receipt"],
+    }, ensure_ascii=False, indent=2))
+    application_id = v["application_id"]
+    print("该类型当时判定依据：")
+    for line in v["determination_basis"]["claim_basis"]:
+        print("  -", line)
+
+    print("\n===== 2) 同订单同键同类型重试：返回原凭证（200, idempotent_replay=true） =====")
+    v2 = call("POST", claims_path, {
+        "claim_type": "delay", "idempotency_key": "IDEMP-DELAY-001",
+        "received_at": "2025-03-01T12:00:00+08:00"})   # 即使给更晚的接收时间也不改判
+    if v2:
+        print(f"  application_id 相同={v2['application_id'] == application_id}, "
+              f"idempotent_replay={v2['idempotent_replay']}")
+
+    print("\n===== 3) 同一幂等键改报破损：409 IDEMPOTENCY_KEY_CONFLICT =====")
+    call("POST", claims_path, {
+        "claim_type": "damage", "idempotency_key": "IDEMP-DELAY-001",
+        "received_at": "2025-02-20T12:00:00+08:00"})
+
+    print("\n===== 4) 换一个键重复申请同类型：409 CLAIM_ALREADY_ACCEPTED =====")
+    call("POST", claims_path, {
+        "claim_type": "delay", "idempotency_key": "IDEMP-DELAY-002",
+        "received_at": "2025-02-20T12:00:00+08:00"})
+
+    print("\n===== 5) 触发事件尚未出现（2/8 破损类 pending）：422 CLAIM_PENDING，无凭证 =====")
+    call("POST", claims_path, {
+        "claim_type": "damage", "idempotency_key": "IDEMP-DMG-001",
+        "received_at": "2025-02-08T12:00:00+08:00"})
+
+    print("\n===== 6) 截止后（2/26）才申请丢失类（pending）：422 CLAIM_PENDING =====")
+    call("POST", claims_path, {
+        "claim_type": "loss", "idempotency_key": "IDEMP-LOSS-001",
+        "received_at": "2025-02-26T08:00:00+08:00"})
+
+    print("\n===== 7) 幂等键也可用 Idempotency-Key 请求头提供 =====")
+    call("POST", claims_path,
+         {"claim_type": "loss", "received_at": "2025-02-12T09:00:00+08:00"},
+         headers={"Idempotency-Key": "IDEMP-LOSS-HDR"})
+
+    print("\n===== 8) 查询凭证及其判定代号/判定依据 =====")
+    got = call("GET", f"{claims_path}/{application_id}")
+    if got:
+        print(f"  {got['application_id']} | {got['determination_code']} | "
+              f"截止 {got['deadline_local']}")
+
+    listed = call("GET", claims_path, params={"determination_code": "DELAY_FILABLE"})
+    if listed:
+        print(f"  按代号 DELAY_FILABLE 过滤：{listed['count']} 张凭证")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@
 - 当前是否可申请（`eligible_to_file` / `overall_status`）；
 - 各理赔类型的**截止时间**（当地时间 + UTC）；
 - **缺失证据**清单；
-- 逐条可审计的**判定依据**（含适用政策版本、起算事件、跳节假日说明、更正记录）。
+- 逐条可审计的**判定依据**（含适用政策版本、起算事件、跳节假日说明、更正记录）；
+- 客户正式提交理赔申请时的**受理判定与不可变凭证**（按服务接收时间核验、幂等、可查询）。
 
 ## 判定规则
 
@@ -54,6 +55,50 @@
    更正只影响"物化"后的判定视图，原始事件行永不修改或删除。
 6. **无写入预演**：`POST .../events/preview` 在当前最新代事件视图上按同一套规则模拟整批处理，返回逐项校验结果、首个失败位置、模拟后的各理赔状态/截止时间/缺失证据与判定依据差异；任一事件违反约束即整批预演失败（错误码与正式摄取一致），全程不写事件、不开新代、不改归档快照。已归档订单的预演明确按**新一代**（`gen_no+1`）结果计算。
 
+## 理赔申请受理与不可变凭证（v1.1 新增）
+
+判定接口回答"现在能不能申请"；**受理接口**回答"客户此刻正式提交的这张申请，收不收、出不出凭证"。
+
+### 核验口径
+
+客户按**订单 + 理赔类型**提交申请（`POST /api/v1/orders/{id}/claims`），服务以**实际接收时间** `received_at`（带时区偏移；缺省取服务当前 UTC 时间）为唯一核验基准，重新核验：
+
+1. 该订单**当前代**经更正物化后的有效扫描事件；
+2. **下单时锁定的政策版本**（不使用任何后发新政）；
+3. 该类型在订单时区/节假日表下的**当地截止时刻**（同口径比较）。
+
+即使当前代**已归档**，也按接收时间**重新核验**，绝不把较早的归档快照当成实时资格；归档快照本身原样保留。凭证内 `generation_archived_at_receipt=true` 并在判定依据中显式说明这一点。
+
+### 受理结果
+
+- 仅当该类型状态为 **`filable`** 才受理（HTTP 201），返回不可变凭证：申请编号 `application_id`（`CLM-xxxxxxxx`）、受理时间 `accepted_at`、**判定代号**（`DELAY_FILABLE` / `DAMAGE_FILABLE` / `LOSS_FILABLE`）、适用政策 `applied_policy`、当地截止时间 `deadline_local`/`deadline_utc`、以及 `basis` 与 `determination_basis`（当时逐条判定依据与证据快照）。
+- 其余状态一律拒绝（HTTP 422），返回**可区分的业务错误码**，**不生成凭证**：
+
+  | 类型状态 | 错误码 | 判定代号（details.determination_code） |
+  |---|---|---|
+  | `pending` | `CLAIM_PENDING` | `DELAY_PENDING` 等 |
+  | `not_filable`（已过截止） | `CLAIM_NOT_FILABLE` | `DELAY_NOT_FILABLE` 等 |
+  | `not_applicable`（事由不成立） | `CLAIM_NOT_APPLICABLE` | `DELAY_NOT_APPLICABLE` 等 |
+  | `indeterminate`（证据不足） | `CLAIM_INDETERMINATE` | `DELAY_INDETERMINATE` 等 |
+
+  错误体沿用统一约定，`error.details` 内含判定代号、政策版本、截止时间与该类型判定依据。
+
+### 幂等与并发
+
+幂等键取请求体 `idempotency_key` 或 `Idempotency-Key` 请求头（二选一，必填）：
+
+- **同订单 + 同键 + 同类型重试**：返回原凭证（HTTP 200，`idempotent_replay=true`）；即使重试时携带更晚的 `received_at`，判定仍以首次接收为准。**业务拒绝同样幂等**——同键重放返回与首次一致的拒绝体；
+- **同订单 + 同键 + 换类型**：`409 IDEMPOTENCY_KEY_CONFLICT`（不受理、不出凭证）；
+- **同订单 + 同类型至多一张凭证**：换不同键再次提交 => `409 CLAIM_ALREADY_ACCEPTED`，details 给出已存在的凭证号；并发不同键同时提交由数据库唯一约束 + 串行写事务兜底，**绝不双重受理**（落败键也留痕，其重试回放同一 409）。
+
+### 不可变与查询
+
+凭证及其判定依据**一经受理不可变**：之后的迟到更正、新一代判定只影响新的实时判定，已出凭证内容不变。
+
+- `GET .../claims`：列出订单凭证，可按 `claim_type`、`determination_code`（如 `DELAY_FILABLE`）过滤；
+- `GET .../claims/{application_id}`：取单张凭证及其所依据的判定代号与判定依据；
+- 凭证不存在 => `404 CLAIM_NOT_FOUND`。
+
 ## 目录结构
 
 ```
@@ -62,14 +107,15 @@ app/
   constants.py     # 事件/理赔类型与中文标签
   db.py            # SQLite 连接、建表、串行化写事务
   engine.py        # 纯函数核心：政策选取/工作日推算/事件物化/判定
-  errors.py        # 业务错误码
-  schemas.py       # Pydantic 入参模型与时区校验
+  errors.py        # 业务错误码（含理赔受理拒绝码与冲突码）
+  schemas.py       # Pydantic 入参模型与时区校验（含理赔受理请求）
   seed_data.py     # 政策版本 + CN 2024/2025 节假日种子
   services.py      # 订单、事件摄取、归档/开代、判定装配
+  claims.py        # 理赔申请受理：接收时间核验/不可变凭证/幂等与并发裁决
   main.py          # FastAPI 路由
-init_db.py         # 初始化入口（建表 + 种子，幂等）
-examples/call_api.py  # 端到端调用示例（仅标准库）
-tests/             # pytest 引擎单测 + API 端到端测试（41 个用例）
+init_db.py         # 初始化入口（建表 + 种子，幂等；新表随启动自动创建）
+examples/call_api.py  # 端到端调用示例（仅标准库，含受理/幂等/拒绝/查询链路）
+tests/             # pytest 引擎单测 + API 端到端测试（63 个用例）
 Dockerfile, docker-compose.yml
 ```
 
@@ -130,6 +176,9 @@ pytest -q
 | GET | `/api/v1/orders/{id}/determination?as_of=...` | 当前判定（最新代已归档则返回快照） |
 | POST | `/api/v1/orders/{id}/determination/archive?as_of=...` | 归档当前代判定 |
 | GET | `/api/v1/orders/{id}/determinations` | 全部"代"的判定历史与快照 |
+| POST | `/api/v1/orders/{id}/claims` | **理赔申请受理**：按接收时间核验，filable 出不可变凭证（幂等） |
+| GET | `/api/v1/orders/{id}/claims?claim_type=&determination_code=` | 查询订单凭证（可按类型/判定代号过滤） |
+| GET | `/api/v1/orders/{id}/claims/{application_id}` | 查询单张凭证及其判定代号/依据 |
 | GET | `/api/v1/policies` | 政策版本列表 |
 | GET | `/api/v1/calendars/{code}` | 节假日表 |
 
@@ -269,9 +318,51 @@ curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/events/preview \
 
 预演失败（如到达顺序违规）返回与正式摄取相同的错误码，`error.details` 内含逐项校验结果与 `first_failure_index`，且同样零写入。
 
+**6) 正式提交理赔申请：按服务接收时间核验，filable 出凭证**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/claims \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "claim_type": "delay",
+    "idempotency_key": "crm-ticket-20250220-77",
+    "received_at": "2025-02-20T12:00:00+08:00"
+  }'
+```
+
+成功（201）响应节选：
+
+```json
+{
+  "application_id": "CLM-A1B2C3D4E5F60718",
+  "order_id": "O-1001",
+  "claim_type": "delay",
+  "received_at_local": "2025-02-20T12:00:00+08:00",
+  "accepted_at_utc": "2025-02-20T04:00:00+00:00",
+  "determination_code": "DELAY_FILABLE",
+  "applied_policy": {"version": "v2", "locked_at_order_creation": true,
+                     "window": {"days": 10, "day_basis": "business", "cutoff": "23:59:59"}},
+  "deadline_local": "2025-02-25T23:59:59+08:00",
+  "deadline_utc": "2025-02-25T15:59:59+00:00",
+  "idempotent_replay": false,
+  "basis": ["...", "凭证及判定依据一经受理不可变；后续更正或新一代判定不影响本凭证"],
+  "determination_basis": {"claim_status": "filable", "claim_basis": ["..."], "evidence": ["..."]}
+}
+```
+
+同键同类型重试得到 **200** 与原凭证（`idempotent_replay=true`）；同键改报 `damage` 得到 `409 IDEMPOTENCY_KEY_CONFLICT`；换键重复申请 `delay` 得到 `409 CLAIM_ALREADY_ACCEPTED`；接收时间晚于截止（如 `2025-02-26`）得到 `422 CLAIM_NOT_FILABLE`，错误体含判定代号 `DELAY_NOT_FILABLE`、截止时间与判定依据，且不产生凭证。
+
+```bash
+# 按凭证号查询凭证及其判定代号；按判定代号过滤订单凭证
+curl -s http://localhost:8000/api/v1/orders/O-1001/claims/CLM-A1B2C3D4E5F60718
+curl -s "http://localhost:8000/api/v1/orders/O-1001/claims?determination_code=DELAY_FILABLE"
+```
+
 ## 设计取舍与扩展
 
 - **存储**：SQLite + 进程内互斥锁，事件"顺序校验 + 插入"在单事务内完成；水平扩展或多副本时把 `app/db.py` 换成 Postgres（事件表加 `(order_id, arrived_at)` 约束即可）。
 - **新增政策版本**：向 `policies` 表插入一行 JSON（时限天数、工作日/自然日、截止钟点均可配），无需发版；新增节假日在 `calendars` 表 upsert。
 - **新增理赔类型/扫描事件**：在 `constants.py` 登记标签、政策 JSON 增规则、`engine.py` 增加一个 resolver，接口与代际机制无需改动。
 - 截止钟点默认 23:59:59，可被政策窗口级 `cutoff` 或环境变量 `CLAIM_DEFAULT_CUTOFF` 覆盖。
+- **凭证存储**：`claim_applications` 以 `(order_id, claim_type)` 唯一保证一类一证，`claim_idempotency` 以 `(order_id, idempotency_key)` 为主键记录受理/拒绝/并发落败结果——拒绝也幂等、落败键重试回放同一 409。单进程靠串行写事务裁决，多副本/多进程靠这两组唯一约束兜底，换 Postgres 时保持约束即可。
+- **已归档代的受理核验**：受理路径不复用返回快照的实时判定接口，而是在当前最新代（无论是否归档）的物化事件上以 `received_at` 现算一次 `evaluate`；归档快照只作为历史凭证，不参与实时资格。

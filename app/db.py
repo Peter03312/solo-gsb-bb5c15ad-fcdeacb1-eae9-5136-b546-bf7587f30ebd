@@ -65,6 +65,38 @@ CREATE TABLE IF NOT EXISTS events (
     prev_arrived_at TEXT                    -- 批次内上一事件到达时间，用于报错定位
 );
 CREATE INDEX IF NOT EXISTS idx_events_order ON events(order_id, arrived_at);
+
+-- 理赔申请受理凭证（一经受理不可变；同订单同理赔类型至多一张）
+CREATE TABLE IF NOT EXISTS claim_applications (
+    application_id      TEXT PRIMARY KEY,
+    order_id            TEXT NOT NULL REFERENCES orders(order_id),
+    claim_type          TEXT NOT NULL,            -- delay | damage | loss
+    idempotency_key     TEXT NOT NULL,
+    received_at         TEXT NOT NULL,            -- UTC ISO8601，服务实际接收时间（核验基准）
+    accepted_at         TEXT NOT NULL,            -- UTC ISO8601，受理时间
+    determination_code  TEXT NOT NULL,            -- 判定代号，如 DELAY_FILABLE
+    generation_no       INTEGER NOT NULL,         -- 核验时订单的当前代
+    policy_version      TEXT NOT NULL,            -- 下单时锁定的政策版本
+    deadline_local      TEXT,                     -- 当地截止时间
+    deadline_utc        TEXT,                     -- UTC 截止时间
+    voucher_json        TEXT NOT NULL,            -- 不可变凭证全量（含当时判定依据）
+    created_at          TEXT NOT NULL,
+    UNIQUE (order_id, claim_type),                -- 同订单同类型至多一张凭证
+    UNIQUE (order_id, idempotency_key)            -- 受理键在订单内唯一（与幂等表双保险）
+);
+
+-- 幂等记录：受理结果与业务拒绝结果均落表，保证同订单同键同类型重试返回原结果
+CREATE TABLE IF NOT EXISTS claim_idempotency (
+    order_id        TEXT NOT NULL REFERENCES orders(order_id),
+    idempotency_key TEXT NOT NULL,
+    claim_type      TEXT NOT NULL,                -- 首次使用该键提交的类型（换类型即冲突）
+    outcome         TEXT NOT NULL,                -- accepted | rejected
+    application_id  TEXT,                         -- accepted：对应凭证号
+    rejection_json  TEXT,                         -- rejected：原错误体（code/message/status/details）
+    received_at     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (order_id, idempotency_key)
+);
 """
 
 
